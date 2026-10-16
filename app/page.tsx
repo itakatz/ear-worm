@@ -31,21 +31,24 @@ const INSTRUMENTS = [
 type Phase = 'idle' | 'prepare' | 'listen' | 'repeat';
 type AdvanceMode = 'auto' | 'manual';
 const freq = (midi: number) => 440 * 2 ** ((midi - 69) / 12);
+const mod12 = (value: number) => (value % 12 + 12) % 12;
 
 export default function Home() {
   const [root, setRoot] = useState(7), [triad, setTriad] = useState<Triad>('major'), [extra, setExtra] = useState<Extra>('flat7');
   const [preset, setPreset] = useState('mixolydian'), [pool, setPool] = useState<number[]>(PRESETS.mixolydian.intervals);
   const [length, setLength] = useState(3), [pace, setPace] = useState(1), [replyTime, setReplyTime] = useState(7);
-  const [transpose, setTranspose] = useState(0), [volume, setVolume] = useState(.65), [droneLevel, setDroneLevel] = useState(.8);
+  const [transpose, setTranspose] = useState(0), [volume, setVolume] = useState(.5), [droneLevel, setDroneLevel] = useState(.8);
   const [advanceMode, setAdvanceMode] = useState<AdvanceMode>('auto');
-  const [theme, setTheme] = useState<'light' | 'dark'>('light');
+  const [theme, setTheme] = useState<'light' | 'dark'>('dark');
   const [phase, setPhase] = useState<Phase>('idle'), [phraseNo, setPhraseNo] = useState(0);
   const [active, setActive] = useState<number | null>(null), [countdown, setCountdown] = useState(0);
   const ctx = useRef<AudioContext | null>(null), drone = useRef<{ oscs: OscillatorNode[]; gain: GainNode } | null>(null);
   const timers = useRef<ReturnType<typeof setTimeout>[]>([]), running = useRef(false);
-  const lastPhrase = useRef<number[]>([]), runPhraseRef = useRef<() => void>(() => {});
+  const lastPhrase = useRef<number[]>([]), noteDrought = useRef<Record<number, number>>({}), runPhraseRef = useRef<() => void>(() => {});
   const state = useRef({ root, triad, extra, pool, length, pace, replyTime, transpose, volume, droneLevel, advanceMode });
-  state.current = { root, triad, extra, pool, length, pace, replyTime, transpose, volume, droneLevel, advanceMode };
+  useEffect(() => {
+    state.current = { root, triad, extra, pool, length, pace, replyTime, transpose, volume, droneLevel, advanceMode };
+  }, [root, triad, extra, pool, length, pace, replyTime, transpose, volume, droneLevel, advanceMode]);
   const qualityLabel = `${TRIADS[triad].label}${extra === 'none' ? '' : ` · ${EXTRAS[extra].label}`}`;
   const label = `${NOTES[root]} ${qualityLabel}`;
   const poolNames = useMemo(() => pool.map(i => NOTES[(root + i) % 12]).join(' · '), [pool, root]);
@@ -66,7 +69,7 @@ export default function Home() {
   const startDrone = useCallback(async () => {
     const ac = await audio(); stopDrone(); const s = state.current;
     const master = ac.createGain(), filter = ac.createBiquadFilter();
-    master.gain.setValueAtTime(.0001, ac.currentTime); master.gain.exponentialRampToValueAtTime(.07 * s.droneLevel, ac.currentTime + .6);
+    master.gain.setValueAtTime(.0001, ac.currentTime); master.gain.exponentialRampToValueAtTime(.13 * s.droneLevel, ac.currentTime + .6);
     filter.type = 'lowpass'; filter.frequency.value = 760; filter.Q.value = .45; filter.connect(master).connect(ac.destination);
     const oscs = chordIntervals(s.triad, s.extra).flatMap((interval, i) => ['sine', 'triangle'].map((type, layer) => {
       const osc = ac.createOscillator(), gain = ac.createGain(); osc.type = type as OscillatorType;
@@ -80,28 +83,59 @@ export default function Home() {
     const a = ac.createOscillator(), b = ac.createOscillator(), aGain = ac.createGain(), bGain = ac.createGain();
     a.type = 'sine'; b.type = 'triangle'; a.frequency.value = freq(midi); b.frequency.value = freq(midi) * 2;
     aGain.gain.value = .86; bGain.gain.value = .08; filter.type = 'lowpass'; filter.frequency.value = 1500; filter.Q.value = .35;
-    const fade = Math.min(.3, seconds * .44), peak = .23 * state.current.volume;
+    const fade = Math.min(.3, seconds * .44), peak = .2 * state.current.volume ** 2;
     gain.gain.setValueAtTime(0, now); gain.gain.linearRampToValueAtTime(peak, now + fade);
     gain.gain.setValueAtTime(peak * .88, now + Math.max(fade, seconds - fade)); gain.gain.linearRampToValueAtTime(0, now + seconds);
     a.connect(aGain).connect(filter); b.connect(bGain).connect(filter); filter.connect(gain).connect(ac.destination);
     a.start(); b.start(); a.stop(now + seconds + .03); b.stop(now + seconds + .03);
   }, [audio]);
   const makePhrase = useCallback(() => {
-    const s = state.current, soundingRoot = s.root + s.transpose;
-    const chordPcs = chordIntervals(s.triad, s.extra).map(i => (soundingRoot + i + 120) % 12);
-    const candidates = Array.from({ length: 24 }, (_, i) => 60 + i).filter(m => s.pool.some(x => (s.root + x) % 12 === (m - s.transpose + 120) % 12));
-    const result: number[] = [];
-    const pick = (list: number[]) => {
-      const weighted = list.flatMap(m => Array(chordPcs.includes(m % 12) ? 4 : 1).fill(m)); return weighted[Math.floor(Math.random() * weighted.length)];
+    const s = state.current;
+    const selectedChordTones = new Set(
+      chordIntervals(s.triad, s.extra).filter(interval => s.pool.includes(interval)),
+    );
+    const intervalOf = (midi: number) => mod12(midi - s.transpose - s.root);
+    const candidates = Array.from({ length: 24 }, (_, i) => 60 + i)
+      .filter(midi => s.pool.includes(intervalOf(midi)));
+    const previousShape = lastPhrase.current.map(intervalOf);
+
+    const weightedPick = (list: number[]) => {
+      const weights = list.map(midi => {
+        const interval = intervalOf(midi);
+        const coverageWeight = 1 + Math.min(noteDrought.current[interval] ?? 0, 8) * .9;
+        const harmonyWeight = selectedChordTones.has(interval) ? 1.45 : 1;
+        return coverageWeight * harmonyWeight;
+      });
+      let cursor = Math.random() * weights.reduce((sum, weight) => sum + weight, 0);
+      for (let i = 0; i < list.length; i++) {
+        cursor -= weights[i];
+        if (cursor <= 0) return list[i];
+      }
+      return list[list.length - 1];
     };
-    for (let i = 0; i < s.length; i++) {
-      const usable = candidates.filter(m => (i === 0 || m % 12 !== result[i - 1] % 12) && (i === 0 || Math.abs(m - result[i - 1]) <= 7));
-      const nonRepeating = candidates.filter(m => i === 0 || m % 12 !== result[i - 1] % 12);
-      result.push(pick(usable.length ? usable : nonRepeating));
-    }
-    if (!result.some(m => chordPcs.includes(m % 12)) && Math.random() < .8) {
-      const chord = candidates.filter(m => chordPcs.includes(m % 12) && m !== result.at(-2)); if (chord.length) result[result.length - 1] = pick(chord);
-    }
+
+    const generate = (differentFirst = false) => {
+      const result: number[] = [];
+      for (let i = 0; i < s.length; i++) {
+        const differentPitch = candidates.filter(midi =>
+          (i === 0 || intervalOf(midi) !== intervalOf(result[i - 1])) &&
+          (!differentFirst || i > 0 || intervalOf(midi) !== previousShape[0]));
+        const singable = differentPitch.filter(midi => i === 0 || Math.abs(midi - result[i - 1]) <= 7);
+        result.push(weightedPick(singable.length ? singable : differentPitch));
+      }
+      return result;
+    };
+
+    let result = generate();
+    const sameAsPrevious = (phrase: number[]) => previousShape.length === phrase.length &&
+      phrase.every((midi, i) => intervalOf(midi) === previousShape[i]);
+    for (let attempt = 0; sameAsPrevious(result) && attempt < 20; attempt++) result = generate();
+    if (sameAsPrevious(result) && s.pool.length > 1) result = generate(true);
+
+    const heard = new Set(result.map(intervalOf));
+    s.pool.forEach(interval => {
+      noteDrought.current[interval] = heard.has(interval) ? 0 : (noteDrought.current[interval] ?? 0) + 1;
+    });
     return result;
   }, []);
   const playPhrase = useCallback((phrase: number[], countAsNew: boolean) => {
@@ -122,11 +156,11 @@ export default function Home() {
   const runPhrase = useCallback(() => {
     const phrase = makePhrase(); lastPhrase.current = phrase; playPhrase(phrase, true);
   }, [makePhrase, playPhrase]);
-  runPhraseRef.current = runPhrase;
+  useEffect(() => { runPhraseRef.current = runPhrase; }, [runPhrase]);
   const repeatPhrase = useCallback(() => { if (lastPhrase.current.length) playPhrase(lastPhrase.current, false); }, [playPhrase]);
   const start = useCallback(async () => {
     if (!canStart) return;
-    running.current = true; setPhraseNo(0); setActive(null); setPhase('prepare');
+    running.current = true; lastPhrase.current = []; noteDrought.current = {}; setPhraseNo(0); setActive(null); setPhase('prepare');
     await startDrone();
     timers.current.push(setTimeout(() => runPhraseRef.current(), 2500));
   }, [canStart, startDrone]);
@@ -169,7 +203,7 @@ export default function Home() {
         <section><Title n="03" title="Timing & instrument" sub="Leave room to play it back"/>
           <label className="mode-label">Continue with</label><div className="advance-mode"><button className={advanceMode === 'auto' ? 'selected' : ''} onClick={() => setAdvanceMode('auto')}>After a pause</button><button className={advanceMode === 'manual' ? 'selected' : ''} onClick={() => setAdvanceMode('manual')}>Next phrase button</button></div>
           {advanceMode === 'auto' && <label className="range"><span>Time to repeat <b>{replyTime}s</b></span><input type="range" min="3" max="15" value={replyTime} onChange={e => setReplyTime(+e.target.value)}/></label>}
-          <div className="two"><label>Instrument<select value={transpose} onChange={e => { setTranspose(+e.target.value); if (running.current) setTimeout(() => void startDrone(), 0); }}>{INSTRUMENTS.map(x => <option value={x.shift} key={x.label}>{x.label}</option>)}</select></label><label>Note volume<input className="volume" type="range" min=".2" max="1" step=".05" value={volume} onChange={e => setVolume(+e.target.value)}/></label></div>
+          <div className="two"><label>Instrument<select value={transpose} onChange={e => { setTranspose(+e.target.value); if (running.current) setTimeout(() => void startDrone(), 0); }}>{INSTRUMENTS.map(x => <option value={x.shift} key={x.label}>{x.label}</option>)}</select></label><label>Note volume · {Math.round(volume * 100)}%<input className="volume" type="range" min=".05" max="1" step=".05" value={volume} onChange={e => setVolume(+e.target.value)}/></label></div>
           <label className="range drone-level"><span>Chord level <b>{Math.round(droneLevel * 100)}%</b></span><input type="range" min=".15" max="1.4" step=".05" value={droneLevel} onChange={e => { setDroneLevel(+e.target.value); if (running.current) setTimeout(() => void startDrone(), 0); }}/></label>
           <p className="hint">Notes are shown as written for your instrument; playback is transposed to concert pitch.</p>
         </section>
